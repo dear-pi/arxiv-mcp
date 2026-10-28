@@ -2,7 +2,7 @@
 
 This module is intentionally thin: it validates input, delegates to
 :mod:`arxiv_mcp.client`, and decides how each failure should surface to the
-model. Three tools, two resources, one prompt.
+model. Four tools, two resources, one prompt.
 
 Error policy (see MCP "Handling errors"):
 
@@ -15,6 +15,8 @@ The test in each case is "could a smarter model have avoided this?".
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Annotated, Literal
 
 from mcp import MCPError
@@ -23,6 +25,7 @@ from mcp.server.mcpserver.exceptions import ResourceNotFoundError, ToolError
 from mcp.types import INVALID_PARAMS
 from pydantic import Field
 
+from .cache import TTLCache
 from .client import (
     ArxivAPIError,
     ArxivClient,
@@ -209,12 +212,44 @@ mcp = MCPServer(
 
 _client: ArxivClient | None = None
 
+#: Set ``ARXIV_MCP_CACHE=off`` to disable the response cache entirely.
+_CACHE_DISABLED = {"0", "off", "false", "no"}
+
+
+def default_cache_path() -> Path:
+    """Where the response cache lives, honouring ``ARXIV_MCP_CACHE_PATH``."""
+    override = os.environ.get("ARXIV_MCP_CACHE_PATH")
+    if override:
+        return Path(override).expanduser()
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return base / "arxiv-mcp" / "cache.sqlite"
+
+
+def build_cache() -> TTLCache | None:
+    """Open the SQLite TTL cache, or return ``None`` when it is unavailable.
+
+    A read-only home directory or a sandbox without a writable cache dir must
+    not stop the server from starting - caching is an optimisation, so every
+    failure here degrades to "no cache" rather than an exception.
+    """
+    if os.environ.get("ARXIV_MCP_CACHE", "").strip().lower() in _CACHE_DISABLED:
+        return None
+    try:
+        path = default_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return TTLCache(path)
+    except OSError:
+        return None
+
 
 def get_client() -> ArxivClient:
     """Lazily build the shared client so importing the module has no side effects."""
     global _client
     if _client is None:
-        _client = ArxivClient()
+        _client = ArxivClient(cache=build_cache())
     return _client
 
 
@@ -337,10 +372,22 @@ async def category_trends(
     category: Annotated[str, Field(description="arXiv category, e.g. 'cs.AI' or 'cs.LG'.")],
     window_days: Annotated[int, Field(ge=1, le=365, description="How far back to look.")] = 30,
     sample_size: Annotated[
-        int, Field(ge=10, le=200, description="How many recent papers to sample.")
+        int,
+        Field(
+            ge=10,
+            le=200,
+            description=(
+                "How many of the newest papers to sample. Daily counts describe "
+                "this sample, not the category's true submission volume."
+            ),
+        ),
     ] = 100,
 ) -> CategoryTrend:
-    """Summarise recent submission volume and the most common title terms in a category."""
+    """Sample a category's newest papers and summarise volume and title terms.
+
+    This is a sample-based estimate: it reads the newest ``sample_size`` papers
+    once, so ``daily_counts`` covers only the days those papers span.
+    """
     try:
         return await get_client().category_trends(
             category, window_days=window_days, sample_size=sample_size

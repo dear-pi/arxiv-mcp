@@ -180,3 +180,36 @@ async def test_literature_review_prompt_renders(server_with_fake):
     assert "retrieval augmented generation" in text
     assert "category_trends" in text
     assert "search_papers" in text
+
+
+# ---------------------------------------------------------------------------
+# Client construction
+# ---------------------------------------------------------------------------
+
+
+async def test_get_client_wires_the_ttl_cache(monkeypatch, tmp_path):
+    """The cache module only earns its keep if the server actually passes it in."""
+    monkeypatch.setattr(server_module, "_client", None)
+    monkeypatch.setenv("ARXIV_MCP_CACHE_PATH", str(tmp_path / "cache.sqlite"))
+    monkeypatch.delenv("ARXIV_MCP_CACHE", raising=False)
+
+    client = server_module.get_client()
+    try:
+        assert client._cache is not None
+        assert (tmp_path / "cache.sqlite").is_file()
+    finally:
+        server_module._client = None
+        await client.aclose()
+
+
+async def test_get_client_cache_can_be_disabled(monkeypatch, tmp_path):
+    monkeypatch.setattr(server_module, "_client", None)
+    monkeypatch.setenv("ARXIV_MCP_CACHE", "off")
+    monkeypatch.setenv("ARXIV_MCP_CACHE_PATH", str(tmp_path / "cache.sqlite"))
+
+    client = server_module.get_client()
+    try:
+        assert client._cache is None
+    finally:
+        server_module._client = None
+        await client.aclose()

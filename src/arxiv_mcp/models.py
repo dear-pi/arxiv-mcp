@@ -59,7 +59,12 @@ class CategoryTrend(BaseModel):
     category: str = Field(description="arXiv category, e.g. 'cs.AI'.")
     window_days: int = Field(description="How many days back the sample covers.")
     sampled: int = Field(description="Papers examined (bounded by arXiv's page limit).")
-    daily_counts: dict[str, int] = Field(description="ISO date -> number of submissions.")
-    top_title_terms: list[list] = Field(
-        description="[term, count] pairs from paper titles, most frequent first."
+    daily_counts: dict[str, int] = Field(
+        description=(
+            "ISO date -> submissions among the sampled papers. A sample, not the "
+            "category's full volume; days outside the sampled range are absent."
+        )
+    )
+    top_title_terms: list[tuple[str, int]] = Field(
+        description="(term, count) pairs from paper titles, most frequent first."
     )

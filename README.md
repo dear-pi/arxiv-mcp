@@ -29,7 +29,7 @@ structuredContent the model can actually reason about
 | `search_papers(query, max_results, sort_by, category)` | arXiv search with field syntax (`au:`, `ti:`, `abs:`) | Optional category filter is composed into `cat:X AND (...)` rather than silently ignored |
 | `get_paper(arxiv_id)` | Full metadata for one paper | Strips version suffixes, validates both modern (`2401.12345`) and legacy (`cs.LO/0112017`) identifier forms |
 | `get_pdf_text(arxiv_id, max_pages)` | Downloads the PDF and extracts text from the first pages | Reports page count, how many were parsed, and whether it truncated — so the model knows what it is missing |
-| `category_trends(category, window_days)` | Submission volume per day + most frequent title terms | An analysis tool, not a lookup: it aggregates and tokenises so an agent can answer "is this field heating up?" |
+| `category_trends(category, window_days)` | Submission volume per day + most frequent title terms, over a sample of the newest papers | An analysis tool, not a lookup: it aggregates and tokenises so an agent can answer "is this field heating up?" - the counts are a sample estimate, not the category's true volume |
 
 ### Resources
 
@@ -95,7 +95,12 @@ retries. Found the same way - by actually running it.
 
 **Caching raw response bodies.** Responses are cached keyed by the fully-built request
 URL in SQLite with a TTL. Keying on the URL (rather than a hand-built cache key) means
-the key is correct by construction.
+the key is correct by construction. The server wires this in when it builds its client:
+the database lives under the platform cache directory
+(`%LOCALAPPDATA%\arxiv-mcp\cache.sqlite` on Windows, `~/.cache/arxiv-mcp/cache.sqlite`
+elsewhere), can be moved with `ARXIV_MCP_CACHE_PATH`, and is disabled with
+`ARXIV_MCP_CACHE=off`. A read-only home directory degrades to "no cache" instead of
+stopping the server - caching is an optimisation, not a requirement.
 
 **Error policy follows the MCP spec.** Every failure is placed in one of three buckets:
 
@@ -119,7 +124,7 @@ what makes it unit-testable without starting a server — see `tests/test_client
 ## Tests
 
 ```bash
-pytest                       # 53 tests
+pytest                       # 55 tests
 ruff check .                # lint
 ```
 
@@ -128,35 +133,41 @@ ruff check .                # lint
   the backoff policy: `Retry-After` honoured, capped, jittered.
 - `tests/test_server.py` — the whole server exercised through an in-memory MCP `Client`:
   tool/resource/prompt discovery, structured output, and that each error surfaces in the
-  right bucket.
+  right bucket. Also asserts the server actually hands a `TTLCache` to its client
+  (`ARXIV_MCP_CACHE_PATH` / `ARXIV_MCP_CACHE=off`), so the cache cannot silently become
+  dead code again.
 - `tests/test_models.py`, `tests/test_cache.py` — validation and TTL expiry.
 
 ## Verification status
 
 | Check | Result |
 | --- | --- |
-| `pytest` | 53 passed |
+| `pytest` | 55 passed |
 | `ruff check` / `ruff format --check` | clean |
 | Live `get_paper("1706.03762")` | returns "Attention Is All You Need", 3 authors, `cs.CL`/`cs.LG` |
 | Live `category_trends("cs.AI")` | returns daily counts and title terms |
-| Live `search_papers(...)` | **rate-limited from the dev IP** — see below |
+| Live `search_papers("retrieval augmented generation")` | returns 3 results out of 1,029,300 matches |
 
-The free-text search endpoint is the one thing not verified end-to-end from the
-machine this was built on: arXiv rate-limited that IP (the sandbox shares an
-egress address with other traffic) and kept returning `429`/`ReadTimeout` for
-search queries while `id_list` and `cat:` queries kept succeeding. The client
-handles it correctly — it retries with backoff, then raises a `ToolError` with
-the HTTP status — but the happy path for search is covered by the `respx`-mocked
-tests, not by a live call. Run it once from a residential connection to confirm.
+Free-text search was the last endpoint confirmed live. During development the build
+machine's shared egress IP was rate-limited (repeated `429`/`ReadTimeout` on `search`
+while `id_list` and `cat:` kept working), so for a while only the `respx`-mocked tests
+covered the happy path. Re-run from a different egress and it returns results normally —
+the earlier failures were the IP, not the client. The 3-second throttle and the capped
+`Retry-After`-aware backoff exist precisely because that endpoint is easy to get wrong.
 
 ## Limitations
 
 - `search_papers` returns one page (max 100). arXiv's `start` offset works but is not
   exposed as a tool argument.
+- `category_trends` samples the newest N papers once, so `daily_counts` only covers the
+  days those papers span. For a busy category like `cs.AI` that is a few days, not the
+  requested 30-day window - it estimates activity, it does not count submissions.
 - `get_pdf_text` needs the `pdf` extra and is slow — it downloads the whole PDF.
 - arXiv has no relevance-ranked "related papers" endpoint, so nothing here does
   citation-graph traversal.
-- The server holds one shared `ArxivClient`; there is no per-session configuration.
+- The server holds one shared `ArxivClient` with a single throttle lock, so tool calls in
+  one process are serialised 3 seconds apart. Fine for stdio single-user use, not a
+  multi-tenant deployment.
 
 ## Attribution
 
